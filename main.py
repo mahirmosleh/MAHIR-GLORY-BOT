@@ -50,13 +50,25 @@ MAX_MATCH_DURATION = 800
 MATCH_IDLE_TIMEOUT = 15.0
 
 _accept_friend_request = True
-DEBUG_ALL_PACKETS = False
+DEBUG_ALL_PACKETS = False    # ← শুধু এখানে, একবার
 
 TEAM_MODE = True
 TEAM_SIZE = 4
-TEAM_READY_DELAY = 6.0
-TEAM_INVITE_WAIT = 2.5
-CLAN_ID_DEFAULT = "3105331459"
+# ==================== TEAM TIMING ====================
+TEAM_CREATE_WAIT     = 1.5   # create_team পাঠানোর পর কত wait
+TEAM_INVITE_WAIT     = 1.0   # প্রতি invite এর মাঝে wait
+TEAM_POST_INVITE_WAIT = 2.0  # সব invite শেষে কত wait
+TEAM_START_DELAY     = 0.5   # ⭐ এটা চাবি — invite শেষে ৩ সেকেন্ড পর game start
+TEAM_LOOP_INTERVAL   = 5.0   # প্রতি ৫ সেকেন্ডে ready+start পাঠাবে (loop)
+CLAN_ID_DEFAULT = "3087207343"
+
+# ==================== BOT ACCOUNTS STORAGE ====================
+BOT_ACCOUNTS_DIR = "bot_accounts"
+os.makedirs(BOT_ACCOUNTS_DIR, exist_ok=True)
+
+# ==================== AUTO BIO ====================
+AUTO_BIO_ENABLED = True
+AUTO_BIO_TEXT = "[C][B]WEB : MAHIR.XO.JE [FFD700]TG : MAHIR0208"
 
 AES_KEY = bytes([89, 103, 38, 116, 99, 37, 68, 69, 117, 104, 54, 37, 90, 99, 94, 56])
 AES_IV  = bytes([54, 111, 121, 90, 68, 114, 50, 50, 69, 51, 121, 99, 104, 106, 77, 37])
@@ -997,6 +1009,53 @@ async def join_clan(jwt_token, clan_id):
         print_error(f"[CLAN] {e}")
         return False
 
+# ==================== AUTO BIO ====================
+def create_bio_payload(bio_text):
+    """Build AES-encrypted UpdateSocialBasicInfo payload."""
+    if not bio_text:
+        bio_text = "hello"
+    if len(bio_text) > 300:
+        bio_text = bio_text[:300]
+    fields = {5: "", 6: "", 8: bio_text, 9: 1, 11: "", 12: "", 16: ""}
+    return bytes.fromhex(encrypt_aes(create_proto(fields).hex()))
+
+
+async def change_bio(jwt_token, bio_text, server_url=None):
+    """Set the account bio via UpdateSocialBasicInfo."""
+    if not AUTO_BIO_ENABLED:
+        return False
+    if not jwt_token or not bio_text:
+        return False
+
+    base = (server_url or "https://clientbp.ggpolarbear.com").rstrip("/")
+    url = f"{base}/UpdateSocialBasicInfo"
+
+    headers = {
+        "Accept": "*/*",
+        "Authorization": f"Bearer {jwt_token}",
+        "Content-Type": "application/x-www-form-urlencoded",
+        "ReleaseVersion": "OB55",
+        "User-Agent": "UnityPlayer/2018.4.12f1 (UnityWebRequest/1.0, libcurl/8.5.0-DEV)",
+        "X-GA": "v1 1",
+        "X-GA-SV": str(int(time.time())),
+        "X-Unity-Version": "2018.4.12f1",
+    }
+    try:
+        payload = create_bio_payload(bio_text)
+        ssl_ctx = ssl.create_default_context()
+        ssl_ctx.check_hostname = False
+        ssl_ctx.verify_mode = ssl.CERT_NONE
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as s:
+            async with s.post(url, headers=headers, data=payload, ssl=ssl_ctx) as r:
+                if r.status == 200:
+                    print_success(f"[BIO] ✅ Bio set: {bio_text[:40]}...")
+                    return True
+                print_warning(f"[BIO] status {r.status}")
+                return False
+    except Exception as e:
+        print_warning(f"[BIO] {e}")
+        return False
+
 # ==================== TCP ====================
 async def build_tcp_startup_packet(account_id, token, server_time, key, iv, region="BD", typ='OnLine'):
     uid_hex = f"{int(account_id):016x}"
@@ -1745,12 +1804,14 @@ async def functional_lone_wolf(addrs, starter_packet, account_region, client_ver
             traceback.print_exc()
 
     # =========================================================
-    # TEAM COORDINATOR (LEADER)
-    # Sequence: create_team → fresh → invite all → fresh →
-    #           [ready_for_game → 1s → start_match] loop every 5s
+    # TEAM COORDINATOR (LEADER) — Version 2
+    # Sequence: create_team → wait 1.5s → invite all (1s apart)
+    #           → wait 2s → wait 3s (START DELAY) → start_match loop
     # =========================================================
     async def _team_coordinator():
         try:
+            # ---- Step 0: অপেক্ষা করি সবাই peer এ যোগ হওয়া পর্যন্ত ----
+            print_info(f"[TEAM] Waiting for all {TEAM_SIZE} bots to join peers...")
             while True:
                 async with _team_state["lock"]:
                     n = len(_team_state["peers"])
@@ -1760,17 +1821,18 @@ async def functional_lone_wolf(addrs, starter_packet, account_region, client_ver
                     return
                 await asyncio.sleep(0.5)
 
-            await asyncio.sleep(TEAM_READY_DELAY)
+            print_success(f"[TEAM] ✅ All {TEAM_SIZE} bots connected — starting setup")
 
+            # ---- Step 1: আমি কি leader? ----
             async with _team_state["lock"]:
                 is_leader = (_team_state["leader_uid"] == uid_str)
                 peers_snapshot = dict(_team_state["peers"])
 
             if not is_leader:
-                print_info(f"[TEAM] {uid_str} waiting as member...")
+                print_info(f"[TEAM] {uid_str} is MEMBER — waiting for leader's invite")
                 return
 
-            print_success(f"[TEAM] 👑 {uid_str} — creating team...")
+            print_success(f"[TEAM] 👑 {uid_str} = LEADER — creating team...")
 
             async with _team_state["lock"]:
                 _team_state["team_code"] = None
@@ -1784,47 +1846,45 @@ async def functional_lone_wolf(addrs, starter_packet, account_region, client_ver
                 except Exception:
                     own_id_num = 0
 
-            # ---------- STEP 1: create_team ----------
+            # ---- Step 2: create_team packet পাঠাই ----
             try:
                 pkt = create_team(current_key, current_iv, client_version)
                 if _writer_ref["w"] and not _writer_ref["w"].is_closing():
                     _writer_ref["w"].write(pkt)
                     await _writer_ref["w"].drain()
-                    print_info(f"[TEAM] create_team sent ({len(pkt)}B)")
+                    print_success(f"[TEAM] 📢 create_team sent ({len(pkt)}B)")
             except Exception as e:
                 print_error(f"[TEAM] create_team err: {e}")
 
-            await asyncio.sleep(1.5)
+            await asyncio.sleep(TEAM_CREATE_WAIT)   # 1.5s
 
-            # ---------- STEP 2: team_fresh #1 ----------
+            # ---- Step 3: নিজের info refresh (team_fresh) ----
             try:
                 pkt = team_fresh(int(own_id_num), current_key, current_iv)
                 if _writer_ref["w"] and not _writer_ref["w"].is_closing():
                     _writer_ref["w"].write(pkt)
                     await _writer_ref["w"].drain()
-                    print_success(f"[TEAM] 🔄 team_fresh #1 sent ({len(pkt)}B)")
+                    print_info(f"[TEAM] 🔄 team_fresh sent")
             except Exception as e:
                 print_warning(f"[TEAM] team_fresh err: {e}")
 
             await asyncio.sleep(1.0)
 
-            # ---------- STEP 3: invite 3 others ----------
+            # ---- Step 4: বাকি সবাইকে invite দিই ----
             async def _invite_uid(target_uid, label=""):
-                for attempt in range(2):
-                    try:
-                        inv = invite_player_in_team(int(target_uid), current_key, current_iv)
-                        if _writer_ref["w"] and not _writer_ref["w"].is_closing():
-                            _writer_ref["w"].write(inv)
-                            await _writer_ref["w"].drain()
-                            print_info(f"[TEAM]   invite{label} to {target_uid} #{attempt+1} ({len(inv)}B)")
-                    except Exception as e:
-                        print_warning(f"[TEAM] invite err: {e}")
-                    await asyncio.sleep(0.6)
+                try:
+                    inv = invite_player_in_team(int(target_uid), current_key, current_iv)
+                    if _writer_ref["w"] and not _writer_ref["w"].is_closing():
+                        _writer_ref["w"].write(inv)
+                        await _writer_ref["w"].drain()
+                        print_success(f"[TEAM] 📨 invite{label} → {target_uid} ({len(inv)}B)")
+                except Exception as e:
+                    print_warning(f"[TEAM] invite err: {e}")
 
             invite_count = 0
             for peer_uid, peer_info in peers_snapshot.items():
                 if peer_uid == uid_str:
-                    continue
+                    continue   # নিজেকে invite করব না
                 peer_acc_id = None
                 try:
                     peer_acc_id = peer_info["data"].get("account_id")
@@ -1832,26 +1892,33 @@ async def functional_lone_wolf(addrs, starter_packet, account_region, client_ver
                     pass
                 if not peer_acc_id:
                     peer_acc_id = peer_uid
-                print_success(f"[TEAM] 📨 Inviting bot{invite_count+2} {peer_acc_id}...")
-                await _invite_uid(int(peer_acc_id), f" bot{invite_count+2}")
+
                 invite_count += 1
+                await _invite_uid(int(peer_acc_id), f" bot{invite_count+1}")
+                await asyncio.sleep(TEAM_INVITE_WAIT)   # প্রতি invite এর পর 1s
 
-            await asyncio.sleep(TEAM_INVITE_WAIT + 3.0)
+            print_success(f"[TEAM] ✅ Sent {invite_count} invites total")
 
-            # ---------- STEP 4: team_fresh #2 ----------
+            # ---- Step 5: সবাই join করার জন্য অপেক্ষা ----
+            await asyncio.sleep(TEAM_POST_INVITE_WAIT)  # 2s
+
+            # ---- Step 6: আবার team_fresh (৪ জন verify) ----
             try:
                 pkt = team_fresh(int(own_id_num), current_key, current_iv)
                 if _writer_ref["w"] and not _writer_ref["w"].is_closing():
                     _writer_ref["w"].write(pkt)
                     await _writer_ref["w"].drain()
-                    print_success(f"[TEAM] 🔄 team_fresh #2 sent ({len(pkt)}B)")
+                    print_info(f"[TEAM] 🔄 team_fresh #2 sent")
             except Exception as e:
                 print_warning(f"[TEAM] team_fresh #2 err: {e}")
 
-            await asyncio.sleep(1.0)
+            # ---- Step 7: ⭐ ৩ সেকেন্ড অপেক্ষা তারপর game start ----
+            print_success(f"[TEAM] ⏱ Waiting {TEAM_START_DELAY}s before starting match...")
+            await asyncio.sleep(TEAM_START_DELAY)   # ⭐ এটাই ৩ সেকেন্ড
 
-            # ---------- STEP 5: [ready_for_game → 1s → start_match] loop every 5s ----------
-            print_success(f"[TEAM] 🚀 {uid_str} loop: ready_for_game → 1s → start_match (every 5s)")
+            print_success(f"[TEAM] 🚀 {uid_str} LEADER — starting game loop")
+
+            # ---- Step 8: Main game start loop (প্রতি ৫ সেকেন্ডে ready+start) ----
             while _team_active["flag"]:
                 try:
                     if bot_state.is_paused(uid_str):
@@ -1859,33 +1926,37 @@ async def functional_lone_wolf(addrs, starter_packet, account_region, client_ver
                     async with _team_state["lock"]:
                         if _team_state["leader_uid"] != uid_str:
                             break
+
                     own_id = current_account_data.get('account_id', own_id_num) if current_account_data else own_id_num
 
-                    # --- 5a) READY FOR GAME ---
+                    # ---- 8a: READY FOR GAME ----
                     try:
                         rdy = ready_for_game(int(own_id), current_key, current_iv)
                         if _writer_ref["w"] and not _writer_ref["w"].is_closing():
                             _writer_ref["w"].write(rdy)
                             await _writer_ref["w"].drain()
-                            print_info(f"[TEAM]   ready_for_game ({len(rdy)}B)")
+                            print_info(f"[TEAM] ✅ LEADER ready_for_game sent")
                     except Exception as e:
-                        print_warning(f"[TEAM] ready_for_game err: {e}")
+                        print_warning(f"[TEAM] ready err: {e}")
 
-                    # --- 5b) WAIT 1 SECOND ---
-                    await asyncio.sleep(1.0)
+                    # ⭐ ৩ সেকেন্ড wait (ready ও start_match এর মাঝে)
+                    await asyncio.sleep(TEAM_START_DELAY)
 
-                    # --- 5c) START MATCH ---
-                    sm = start_match_team(int(own_id), current_key, current_iv, region=account_region)
-                    if _writer_ref["w"] and not _writer_ref["w"].is_closing():
-                        _writer_ref["w"].write(sm)
-                        await _writer_ref["w"].drain()
-                        print_info(f"[TEAM]   start_match ({len(sm)}B)")
+                    # ---- 8c: START MATCH ----
+                    try:
+                        sm = start_match_team(int(own_id), current_key, current_iv, region=account_region)
+                        if _writer_ref["w"] and not _writer_ref["w"].is_closing():
+                            _writer_ref["w"].write(sm)
+                            await _writer_ref["w"].drain()
+                            print_success(f"[TEAM] ⚔ LEADER start_match sent")
+                    except Exception as e:
+                        print_warning(f"[TEAM] start_match err: {e}")
 
                 except Exception as e:
-                    print_warning(f"[TEAM] start_match err: {e}")
+                    print_warning(f"[TEAM] leader loop err: {e}")
 
                 try:
-                    await asyncio.wait_for(asyncio.sleep(5.0), timeout=5.5)
+                    await asyncio.wait_for(asyncio.sleep(TEAM_LOOP_INTERVAL), timeout=TEAM_LOOP_INTERVAL + 0.5)
                 except asyncio.TimeoutError:
                     pass
 
@@ -1895,54 +1966,73 @@ async def functional_lone_wolf(addrs, starter_packet, account_region, client_ver
             print_error(f"[TEAM] coordinator error: {e}")
 
     # =========================================================
-    # MEMBER MATCH TRIGGER — [ready_for_game → 1s → start_match] every 5s
+    # MEMBER TRIGGER — waits for leader's invite accept,
+    # then starts its own ready+start_match loop after 3s
     # =========================================================
     async def _member_match_trigger():
         try:
-            await asyncio.sleep(TEAM_READY_DELAY + 18.0)
+            # ---- Step 1: অপেক্ষা করি, আমি member কিনা verify ----
+            await asyncio.sleep(2.0)
+
+            async with _team_state["lock"]:
+                if _team_state["leader_uid"] == uid_str:
+                    return   # আমি leader, member trigger দরকার নেই
+
+            print_info(f"[TEAM] 🧑 {uid_str} = MEMBER — waiting for leader invite...")
+
+            # ---- Step 2: সবাই join করা + 3s delay এর জন্য অপেক্ষা ----
+            # Leader: create(1.5) + fresh(1) + 3 invite(3) + post(2) + fresh2(0) + 3s = ~10.5s
+            # Member safe margin: 13s wait
+            await asyncio.sleep(1.0)
 
             async with _team_state["lock"]:
                 if _team_state["leader_uid"] == uid_str:
                     return
 
-            print_success(f"[TEAM] 🚀 Member {uid_str} loop: ready → 1s → start_match (every 5s)")
+            print_success(f"[TEAM] 🚀 Member {uid_str} — starting game loop")
+
             my_id = current_account_data.get('account_id', uid_str) if current_account_data else uid_str
 
+            # ---- Step 3: Main loop — ready + 3s + start_match, every 5s ----
             while _team_active["flag"]:
                 try:
                     if bot_state.is_paused(uid_str):
                         break
                     if _writer_ref["w"] and not _writer_ref["w"].is_closing():
 
-                        # --- 1) READY FOR GAME ---
+                        # --- READY ---
                         try:
                             rdy = ready_for_game(int(my_id), current_key, current_iv)
                             _writer_ref["w"].write(rdy)
                             await _writer_ref["w"].drain()
-                            print_info(f"[TEAM]   member ready_for_game ({len(rdy)}B)")
+                            print_info(f"[TEAM] ✅ member ready_for_game sent")
                         except Exception as e:
                             print_warning(f"[TEAM] member ready err: {e}")
 
-                        # --- 2) WAIT 1 SECOND ---
-                        await asyncio.sleep(1.0)
+                        # --- ⭐ 3 সেকেন্ড wait ---
+                        await asyncio.sleep(TEAM_START_DELAY)
 
-                        # --- 3) START MATCH ---
-                        sm = start_match_team(int(my_id), current_key, current_iv, region=account_region)
-                        _writer_ref["w"].write(sm)
-                        await _writer_ref["w"].drain()
-                        print_info(f"[TEAM]   member start_match ({len(sm)}B)")
+                        # --- START MATCH ---
+                        try:
+                            sm = start_match_team(int(my_id), current_key, current_iv, region=account_region)
+                            _writer_ref["w"].write(sm)
+                            await _writer_ref["w"].drain()
+                            print_success(f"[TEAM] ⚔ member start_match sent")
+                        except Exception as e:
+                            print_warning(f"[TEAM] member start err: {e}")
 
                 except Exception as e:
-                    print_warning(f"[TEAM] member trigger: {e}")
+                    print_warning(f"[TEAM] member loop err: {e}")
 
                 try:
-                    await asyncio.wait_for(asyncio.sleep(5.0), timeout=5.5)
+                    await asyncio.wait_for(asyncio.sleep(TEAM_LOOP_INTERVAL), timeout=TEAM_LOOP_INTERVAL + 0.5)
                 except asyncio.TimeoutError:
                     pass
+
         except asyncio.CancelledError:
             raise
         except Exception as e:
-            print_warning(f"[TEAM] member trigger outer: {e}")
+            print_warning(f"[TEAM] member trigger error: {e}")
 
     # =========================================================
     # MAIN OUTER LOOP
@@ -2076,6 +2166,9 @@ async def functional_lone_wolf(addrs, starter_packet, account_region, client_ver
                         continue
 
                     if not data:
+                        if bot_state.is_paused(uid_str):
+                            print_info(f"[{uid_str}] Paused — clean close")
+                            break
                         raise ConnectionError("Connection closed")
 
                     hex_data = data.hex()
@@ -2249,6 +2342,10 @@ async def functional_lone_wolf(addrs, starter_packet, account_region, client_ver
             except asyncio.CancelledError:
                 raise
             except Exception as e:
+                # ✅ Pause চেক
+                if bot_state.is_paused(uid_str):
+                    print_info(f"[{uid_str}] Paused — skipping reconnect")
+                    break
                 if "Cache expired" in str(e):
                     print_warning(f"[!] Token expired {uid_str}")
                     break
@@ -2345,10 +2442,161 @@ async def informational(addrs, starter_packet, key, iv, region="BD",
             if ping_task: ping_task.cancel()
             if uid_str: bot_state.unregister_writer(uid_str, writer)
             await safe_close_writer(writer)
+            # ✅ Pause চেক
+            if uid_str and bot_state.is_paused(uid_str):
+                print_info(f"[INFO] {uid_str} paused — no reconnect")
+                continue
             reconnects += 1
             if reconnects > max_reconnects:
                 await asyncio.sleep(3); reconnects = 0
             else: await asyncio.sleep(1)
+
+# ==================== BOT ACCOUNT JSON SAVE ====================
+def _rand_suffix(n=6):
+    return ''.join(random.choices(string.ascii_uppercase + string.digits, k=n))
+
+
+def save_bot_account_json(ad: dict) -> Optional[str]:
+    """
+    Save a freshly-created bot account into its own JSON file:
+      bot_accounts/MAHIR_{RANDOM}.json
+    Returns the filename on success, None on failure.
+    """
+    try:
+        uid         = str(ad.get('auth_uid') or '')
+        account_id  = str(ad.get('account_id') or '')
+        password    = ad.get('auth_password') or ''
+        jwt_token   = ad.get('token') or ''
+        nickname    = ad.get('nickname') or f"Player_{account_id}"
+        region      = ad.get('region') or 'BD'
+        level       = int(ad.get('level') or 1)
+        exp         = int(ad.get('exp') or 0)
+        likes       = int(ad.get('likes') or 0)
+        server_url  = ad.get('server_url') or ''
+        bio         = ad.get('bio') or AUTO_BIO_TEXT
+        bio_updated = bool(ad.get('bio_updated', False))
+
+        # AES key/IV — store as hex so JSON is safe
+        aes_ak = ad.get('aes_ak') or b''
+        iv_i   = ad.get('iv_i') or b''
+        aes_ak_hex = bytes(aes_ak).hex() if isinstance(aes_ak, (bytes, bytearray)) else str(aes_ak)
+        iv_i_hex   = bytes(iv_i).hex()   if isinstance(iv_i,   (bytes, bytearray)) else str(iv_i)
+
+        record = {
+            "uid":           uid,
+            "password":      password,
+            "account_id":    account_id,
+            "nickname":      nickname,
+            "region":        region,
+            "level":         level,
+            "exp":           exp,
+            "likes":         likes,
+            "jwt_token":     jwt_token,
+            "token":         jwt_token,          # alias — many tools expect "token"
+            "server_url":    server_url,
+            "release_version": ad.get('release_version'),
+            "client_version":  ad.get('client_version'),
+            "aes_ak":        aes_ak_hex,
+            "iv_i":          iv_i_hex,
+            "bio":           bio,
+            "bio_updated":   bio_updated,
+            "open_id":       ad.get('open_id'),
+            "access_token":  ad.get('access_token'),
+            "platform":      ad.get('platform'),
+            "server_time":   ad.get('server_time'),
+            "functional_addrs":    ad.get('functional_addrs'),
+            "informational_addrs": ad.get('informational_addrs'),
+            "auth_type":     ad.get('auth_type', 'guest'),
+            "created_at":    datetime.now().isoformat(),
+            "created_by":    "MAHIR-BOT-CREATOR",
+        }
+
+        # Build filename: MAHIR_{RANDOM}.json (retry if collides)
+        for _ in range(8):
+            fname = f"MAHIR_{_rand_suffix(8)}.json"
+            fpath = os.path.join(BOT_ACCOUNTS_DIR, fname)
+            if not os.path.exists(fpath):
+                break
+        else:
+            # ultra-rare fallback — add timestamp
+            fname = f"MAHIR_{int(time.time())}_{_rand_suffix(4)}.json"
+            fpath = os.path.join(BOT_ACCOUNTS_DIR, fname)
+
+        # Atomic write
+        tmp = fpath + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(record, f, indent=2, ensure_ascii=False)
+        os.replace(tmp, fpath)
+
+        print_success(f"[SAVE] 💾 {fname} | UID {uid} | ID {account_id}")
+        return fname
+    except Exception as e:
+        print_error(f"[SAVE] failed: {e}")
+        traceback.print_exc()
+        return None
+
+
+def list_bot_account_files() -> List[dict]:
+    """List all MAHIR_*.json files in BOT_ACCOUNTS_DIR with metadata."""
+    out = []
+    try:
+        for fn in os.listdir(BOT_ACCOUNTS_DIR):
+            if not (fn.startswith("MAHIR_") and fn.endswith(".json")):
+                continue
+            fp = os.path.join(BOT_ACCOUNTS_DIR, fn)
+            try:
+                st = os.stat(fp)
+                with open(fp, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                out.append({
+                    "filename": fn,
+                    "uid": str(data.get("uid", "")),
+                    "account_id": str(data.get("account_id", "")),
+                    "nickname": data.get("nickname", ""),
+                    "region": data.get("region", ""),
+                    "level": data.get("level", 1),
+                    "exp": data.get("exp", 0),
+                    "size": st.st_size,
+                    "modified": datetime.fromtimestamp(st.st_mtime).isoformat(),
+                    "mtime": st.st_mtime,
+                })
+            except Exception:
+                continue
+        out.sort(key=lambda x: x["mtime"], reverse=True)
+    except Exception as e:
+        print_error(f"[LIST-BOT-FILES] {e}")
+    return out
+
+
+def load_bot_account_file(filename: str) -> Optional[dict]:
+    """Load a single MAHIR_*.json file safely."""
+    if not filename.startswith("MAHIR_") or not filename.endswith(".json"):
+        return None
+    if "/" in filename or "\\" in filename or ".." in filename:
+        return None
+    fp = os.path.join(BOT_ACCOUNTS_DIR, filename)
+    if not os.path.exists(fp):
+        return None
+    try:
+        with open(fp, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def delete_bot_account_file(filename: str) -> bool:
+    if not filename.startswith("MAHIR_") or not filename.endswith(".json"):
+        return False
+    if "/" in filename or "\\" in filename or ".." in filename:
+        return False
+    fp = os.path.join(BOT_ACCOUNTS_DIR, filename)
+    if os.path.exists(fp):
+        try:
+            os.remove(fp)
+            return True
+        except Exception:
+            return False
+    return False
 
 # ==================== ACCOUNT HELPERS ====================
 def _register_credentials(ad):
@@ -2515,7 +2763,7 @@ def _gf_field(ld, key, default=None):
     if isinstance(v, dict): return v.get("data", default)
     return v if v is not None else default
 
-async def create_four_accounts(region: str, clan_id: str, count: int = 4, password: str = "MARUF"):
+async def create_four_accounts(region: str, clan_id: str, count: int = 4, password: str = "MAHIR"):
     """
     Create N new guest accounts:
       register → grant → MajorRegister → MajorLogin #1 (JWT only)
@@ -2524,6 +2772,13 @@ async def create_four_accounts(region: str, clan_id: str, count: int = 4, passwo
     """
     bot_state.creating = True
     bot_state.create_progress = []
+
+    # ⭐ Reset team state — নতুন team এর জন্য পরিষ্কার করা
+    async with _team_state["lock"]:
+        _team_state["peers"].clear()
+        _team_state["leader_uid"] = None
+        _team_state["team_code"] = None
+    print_success(f"[TEAM] 🧹 Team state reset for new {count}-bot team")
 
     def _prog(s):
         try:
@@ -2553,15 +2808,21 @@ async def create_four_accounts(region: str, clan_id: str, count: int = 4, passwo
         for i in range(count):
             _prog(f"⌛ Creating bot {i+1}/{count}...")
             try:
+                # 👇 নতুন লাইন — প্রতি bot এর জন্য আলাদা random password
+                bot_password = f"MAHIR_{_rand_suffix(6)}"
+                _prog(f"   → password: {bot_password}")
+
                 # ===== (a) Guest register =====
-                uid = await register_account(password, gop_1, app_version)
+                uid = await register_account(bot_password, gop_1, app_version)
+               
                 if not uid:
                     _prog(f"❌ bot {i+1}: register failed")
                     continue
                 _prog(f"   → registered UID {uid}")
 
                 # ===== (b) Grant OAuth token =====
-                tok = await grant_token(uid, password, gop_1, app_version)
+                tok = await grant_token(uid, bot_password, gop_1, app_version)
+                
                 if not tok:
                     _prog(f"❌ bot {i+1}: grant failed")
                     continue
@@ -2578,7 +2839,7 @@ async def create_four_accounts(region: str, clan_id: str, count: int = 4, passwo
                     continue
 
                 # ===== (d) MajorRegister =====
-                nickname_final = f"MARUF•{''.join(random.choices(string.ascii_uppercase + string.digits, k=5))}"
+                nickname_final = f"MAHIR•{''.join(random.choices(string.ascii_uppercase + string.digits, k=5))}"
                 mr = await major_register(
                     release_v, access_token, open_id,
                     nickname_final, game_version, login_url, lang
@@ -2717,6 +2978,23 @@ async def create_four_accounts(region: str, clan_id: str, count: int = 4, passwo
                     likes = int(_gf(8, 0) or 0)
                     nickname_final = _gf(4, nickname_final) or nickname_final
 
+                # ===== (i.2) AUTO BIO — after GetLoginData =====
+                if AUTO_BIO_ENABLED:
+                    _prog(f"   → setting auto bio...")
+                    try:
+                        await asyncio.sleep(0.5)
+                        bio_ok = await change_bio(
+                            jwt_token,
+                            AUTO_BIO_TEXT,
+                            server_url_raw
+                        )
+                        if bio_ok:
+                            _prog(f"   ✅ bio set")
+                        else:
+                            _prog(f"   ⚠️ bio set failed (non-fatal)")
+                    except Exception as e:
+                        _prog(f"   ⚠️ bio error: {e}")
+
                 # ===== (j) Assemble account dict =====
                 ad = {
                     'account_id': acc_id_raw,
@@ -2740,10 +3018,19 @@ async def create_four_accounts(region: str, clan_id: str, count: int = 4, passwo
                     'login_payload_data': login_payload,
                     'auth_type': 'guest',
                     'auth_uid': uid,
-                    'auth_password': password,
+                    'auth_password': bot_password,
+                    'bio': AUTO_BIO_TEXT,           # <-- নতুন
+                    'bio_updated': AUTO_BIO_ENABLED, # <-- নতুন
                 }
                 _register_credentials(ad)
                 cache_set(uid, ad)
+
+                # ===== (k) SAVE BOT AS SEPARATE JSON FILE =====
+                saved_fname = save_bot_account_json(ad)
+                if saved_fname:
+                    ad['json_file'] = saved_fname
+                    _prog(f"   💾 saved → bot_accounts/{saved_fname}")
+
                 created.append(ad)
                 _prog(f"✅ bot {i+1}: {nickname_final} | UID {acc_id_raw} | Lvl {level}")
 
@@ -2889,6 +3176,7 @@ async def api_ping(request):
     })
 
 # ---------- /api/stats ----------
+# ---------- /api/stats ----------
 async def api_stats(request):
     try:
         accs = list(bot_state.accounts.values())
@@ -2911,6 +3199,12 @@ async def api_stats(request):
             except Exception:
                 continue
 
+        # ---- Bot files (MAHIR_*.json) ----
+        try:
+            bot_files = list_bot_account_files()
+        except Exception:
+            bot_files = []
+
         data = {
             "accounts": accs,
             "logs": logs_out,
@@ -2928,6 +3222,10 @@ async def api_stats(request):
             "team_code": _team_state.get("team_code"),
             "leader_uid": _team_state.get("leader_uid"),
             "team_size": len(_team_state["peers"]),
+
+            # ---- Bot JSON files info ----
+            "bot_files_count": len(bot_files),
+            "bot_files": bot_files,
         }
 
         # 🔥 Bulletproof serialization — default=str catches anything weird
@@ -2954,6 +3252,8 @@ async def api_stats(request):
                 "total_gained_exp": 0,
                 "uptime": 1,
                 "exp_per_hour": 0,
+                "bot_files_count": 0,
+                "bot_files": [],
             }),
             content_type="application/json",
             charset="utf-8",
@@ -3012,14 +3312,19 @@ async def api_create_team(request):
         region = str(body.get("region", "BD")).upper()
         clan_id = str(body.get("clan_id", "")).strip()
         count = int(body.get("count", 4))
-        password = str(body.get("password", "MARUF")).strip() or "MARUF"
+        password = str(body.get("password", "MAHIR")).strip() or "MAHIR"
 
         if not clan_id:
             return aiohttp.web.json_response({"ok": False, "error": "clan_id required"})
         if bot_state.creating:
             return aiohttp.web.json_response({"ok": False, "error": "already creating"})
 
-        count = max(1, min(4, count))
+        count = max(1, min(4, count))   # ← clamp আগে
+        
+        global TEAM_SIZE
+        TEAM_SIZE = count               # ← তারপর সেট
+        print_success(f"[TEAM] Setting TEAM_SIZE = {count}")
+
         asyncio.create_task(create_four_accounts(region, clan_id, count, password))
         return aiohttp.web.json_response({"ok": True, "msg": f"creating {count} bots for {region}"})
     except Exception as e:
@@ -3130,6 +3435,89 @@ async def api_logs_clear(request):
     bot_state.logs = []
     return aiohttp.web.json_response({"status": "ok"})
 
+# ---------- BOT ACCOUNT FILES API ----------
+async def api_bot_files_list(request):
+    """GET /api/bot_files — list all MAHIR_*.json bot files."""
+    try:
+        files = list_bot_account_files()
+        return aiohttp.web.json_response({
+            "status": "ok",
+            "count": len(files),
+            "files": files,
+        })
+    except Exception as e:
+        return aiohttp.web.json_response({"status": "error", "error": str(e)})
+
+
+async def api_bot_files_view(request):
+    """GET /api/bot_files/view?file=MAHIR_XXXX.json"""
+    fname = request.query.get("file", "").strip()
+    if not fname:
+        return aiohttp.web.json_response({"status": "error", "error": "file required"}, status=400)
+    data = load_bot_account_file(fname)
+    if not data:
+        return aiohttp.web.json_response({"status": "error", "error": "not found"}, status=404)
+    return aiohttp.web.json_response({"status": "ok", "file": fname, "data": data})
+
+
+async def api_bot_files_delete(request):
+    """POST /api/bot_files/delete  body: {"file": "MAHIR_XXX.json"}"""
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    fname = str(body.get("file", "")).strip()
+    if not fname:
+        return aiohttp.web.json_response({"status": "error", "error": "file required"}, status=400)
+    ok = delete_bot_account_file(fname)
+    if ok:
+        print_warning(f"[BOT-FILES] 🗑 Deleted {fname}")
+    return aiohttp.web.json_response({"status": "ok" if ok else "error"})
+
+
+async def api_bot_files_download(request):
+    """GET /api/bot_files/download?file=MAHIR_XXX.json"""
+    fname = request.query.get("file", "").strip()
+    if not fname or not fname.startswith("MAHIR_") or not fname.endswith(".json"):
+        return aiohttp.web.Response(status=400, text="invalid filename")
+    if "/" in fname or "\\" in fname or ".." in fname:
+        return aiohttp.web.Response(status=400, text="invalid filename")
+    fp = os.path.join(BOT_ACCOUNTS_DIR, fname)
+    if not os.path.exists(fp):
+        return aiohttp.web.Response(status=404, text="not found")
+    return aiohttp.web.FileResponse(
+        fp,
+        headers={"Content-Disposition": f'attachment; filename="{fname}"'}
+    )
+
+
+async def api_bot_files_download_all(request):
+    """GET /api/bot_files/download_all — bundle every MAHIR_*.json into one zip."""
+    import zipfile, io as _io
+    try:
+        buf = _io.BytesIO()
+        added = 0
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+            for fn in os.listdir(BOT_ACCOUNTS_DIR):
+                if not (fn.startswith("MAHIR_") and fn.endswith(".json")):
+                    continue
+                fp = os.path.join(BOT_ACCOUNTS_DIR, fn)
+                if os.path.exists(fp):
+                    zf.write(fp, arcname=fn)
+                    added += 1
+            if added == 0:
+                return aiohttp.web.json_response({"status": "error", "error": "no files"})
+        buf.seek(0)
+        fname_out = f"MAHIR_BOTS_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip"
+        return aiohttp.web.Response(
+            body=buf.read(),
+            content_type="application/zip",
+            headers={"Content-Disposition": f'attachment; filename="{fname_out}"'}
+        )
+    except Exception as e:
+        traceback.print_exc()
+        return aiohttp.web.json_response({"status": "error", "error": str(e)})
+
 async def account_loop_token(token):
     """Token-based login loop."""
     print_info(f"[TOKEN] Login with token {token[:20]}...")
@@ -3202,7 +3590,13 @@ async def start_web_server():
     app.router.add_post("/api/account/pause_all", api_account_pause_all)
     app.router.add_post("/api/logs/clear", api_logs_clear)
     app.router.add_get("/api/progress", api_progress)
-
+    # Bot account files (MAHIR_*.json)
+    app.router.add_get ("/api/bot_files",              api_bot_files_list)
+    app.router.add_get ("/api/bot_files/view",         api_bot_files_view)
+    app.router.add_post("/api/bot_files/delete",       api_bot_files_delete)
+    app.router.add_get ("/api/bot_files/download",     api_bot_files_download)
+    app.router.add_get ("/api/bot_files/download_all", api_bot_files_download_all)
+    
     runner = aiohttp.web.AppRunner(app)
     await runner.setup()
     site = aiohttp.web.TCPSite(runner, WEB_HOST, WEB_PORT)
