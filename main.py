@@ -198,6 +198,72 @@ _team_state = {
     "lock": asyncio.Lock(),
 }
 
+# ==================== TEAM STATE FILE ====================
+TEAM_STATE_FILE = "current_team.json"
+
+def save_team_state(leader_auth_uid, member_auth_uids, region, clan_id, created_list=None):
+    """Save current team — supports both auth_uid and account_id for leader detection."""
+    try:
+        data = {
+            "created_at": datetime.now().isoformat(),
+            "leader_uid": str(leader_auth_uid),           # auth_uid (registration)
+            "leader_account_id": None,                    # account_id (game)
+            "member_uids": [str(u) for u in member_auth_uids],
+            "member_account_ids": [],
+            "team_size": len(member_auth_uids) + 1,
+            "region": region,
+            "clan_id": clan_id,
+            "team_code": None,
+            "status": "forming",
+        }
+        
+        # ⭐ created_list থেকে account_id গুলো বের করি
+        if created_list:
+            # Leader
+            if len(created_list) > 0:
+                leader_ad = created_list[0]
+                data["leader_account_id"] = str(leader_ad.get("account_id", ""))
+            
+            # Members
+            for ad in created_list[1:]:
+                data["member_account_ids"].append(str(ad.get("account_id", "")))
+        
+        with open(TEAM_STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+        
+        print_success(f"[TEAM-FILE] 💾 Saved | leader_auth={leader_auth_uid} | "
+                      f"leader_acc={data['leader_account_id']} | members={len(member_auth_uids)}")
+        return True
+    except Exception as e:
+        print_error(f"[TEAM-FILE] save failed: {e}")
+        return False
+
+
+def update_team_state(**kwargs):
+    """Update fields in team JSON (team_code, status, etc)."""
+    try:
+        if not os.path.exists(TEAM_STATE_FILE):
+            return False
+        with open(TEAM_STATE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        data.update(kwargs)
+        with open(TEAM_STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+        return True
+    except Exception:
+        return False
+
+
+def load_team_state():
+    """Load current team file."""
+    try:
+        if not os.path.exists(TEAM_STATE_FILE):
+            return None
+        with open(TEAM_STATE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
 # ==================== PRINT HELPERS ====================
 class C:
     GREEN='\033[92m'; FAIL='\033[91m'; WARNING='\033[93m'
@@ -1482,7 +1548,10 @@ async def play_game(server_ip_port, thunder, sharma, udp_key, match_code,
         move_x, move_y, move_z = 0, 0, 0
 
         async def movement_loop():
+            """Continuously send movement packets until match finishes."""
             nonlocal movement_counter, tick, move_x, move_y, move_z
+            packet_count = 0
+            print_info(f"[MATCH #{match_index}] 🏃 movement_loop STARTED")
             while not movement_stop.is_set():
                 try:
                     move_x += random.randint(-30, 30)
@@ -1493,21 +1562,43 @@ async def play_game(server_ip_port, thunder, sharma, udp_key, match_code,
                     if abs(move_z) > 500:  move_z = 0
                     tick = (tick + 1) & 0xFFFF
                     movement_counter = (movement_counter + 1) & 0xFFFF
+
                     pkt = build_movement_packet_2001(
-                        key_bytes=udp_key_bytes, msg_key=0x5C,
-                        player_state=1, x=move_x, y=move_y, z=move_z,
-                        tick=tick, counter=movement_counter,
-                        move_state=1, account_uid=account_id,
-                        room_code=match_code, phase="arena")
+                        key_bytes=udp_key_bytes,
+                        msg_key=0x5C,
+                        player_state=1,
+                        x=move_x, y=move_y, z=move_z,
+                        tick=tick,
+                        counter=movement_counter,
+                        move_state=1,
+                        account_uid=account_id,
+                        room_code=match_code,
+                        phase="arena",
+                    )
                     try:
                         await loop.sock_sendto(sock, pkt, (resolved_ip, port))
-                    except Exception: pass
-                except Exception: pass
-                try: await asyncio.wait_for(movement_stop.wait(), timeout=0.8)
-                except asyncio.TimeoutError: pass
+                        packet_count += 1
+                        # প্রতি ২০ packet এ log দেখাই
+                        if packet_count % 20 == 0:
+                            print_info(f"[MATCH #{match_index}] 🏃 movement #{packet_count} | "
+                                       f"x={move_x} y={move_y} z={move_z}")
+                    except Exception as e:
+                        print_warning(f"[MATCH #{match_index}] movement send err: {e}")
+                except Exception as e:
+                    print_warning(f"[MATCH #{match_index}] movement loop err: {e}")
+
+                try:
+                    await asyncio.wait_for(movement_stop.wait(), timeout=0.5)
+                except asyncio.TimeoutError:
+                    pass
+
+            print_info(f"[MATCH #{match_index}] 🛑 movement_loop STOPPED (sent {packet_count} packets)")
+
+        # ✅ Movement loop reference — একবার চালু হলে আর বন্ধ হবে না match শেষ পর্যন্ত
+        movement_task = None
 
         async def send_thunder_sharma_inline():
-            nonlocal ack_state, thunder_sent
+            nonlocal ack_state, thunder_sent, movement_task
             if thunder_sent: return
             async with send_lock:
                 if thunder_sent: return
@@ -1521,14 +1612,26 @@ async def play_game(server_ip_port, thunder, sharma, udp_key, match_code,
                     await asyncio.sleep(0.4)
                     await loop.sock_sendto(sock, bytes.fromhex(sharma), (resolved_ip, port))
                     ack_state = "thunder_sharma_sent"
-                    print_success(f"[MATCH #{match_index}] Playing in-game!")
-                    asyncio.create_task(movement_loop())
+                    print_success(f"[MATCH #{match_index}] 🎮 Playing in-game!")
+
+                    # ✅ Movement loop চালু করি (যদি আগেই না চালু হয়ে থাকে)
+                    if movement_task is None or movement_task.done():
+                        movement_task = asyncio.create_task(movement_loop())
+                        print_success(f"[MATCH #{match_index}] 🏃 Movement task created")
+
                 except Exception as e:
                     print_error(f"[MATCH #{match_index}] startup: {e}")
 
         while not local_closed:
             if time.time() - match_start_time > MAX_MATCH_DURATION:
-                completed_cleanly = True; break
+                completed_cleanly = True
+                print_warning(f"[MATCH #{match_index}] ⏱ Max duration ({MAX_MATCH_DURATION}s) reached — breaking")
+                break
+
+            # ✅ যদি thunder পাঠানো হয়ে গেছে কিন্তু movement_task এখনো চালু হয়নি, চালু করি
+            if thunder_sent and (movement_task is None or movement_task.done()):
+                movement_task = asyncio.create_task(movement_loop())
+                print_info(f"[MATCH #{match_index}] 🏃 movement_task (re)created in main loop")
             try:
                 response, server_addr = await asyncio.wait_for(loop.sock_recvfrom(sock, 65535), timeout=2.0)
                 if response:
@@ -1596,10 +1699,32 @@ async def play_game(server_ip_port, thunder, sharma, udp_key, match_code,
         print_error(f"[MATCH #{match_index}] {e}")
         return f"match #{match_index} error"
     finally:
+        # ✅ প্রথমে movement loop বন্ধ করি (match শেষ)
+        movement_stop.set()
+        print_info(f"[MATCH #{match_index}] 🛑 Signalling movement_stop...")
+
+        # ✅ Movement task কে await করি (graceful shutdown)
+        if movement_task is not None:
+            try:
+                await asyncio.wait_for(movement_task, timeout=2.0)
+            except (asyncio.TimeoutError, asyncio.CancelledError):
+                try:
+                    movement_task.cancel()
+                except Exception:
+                    pass
+            except Exception:
+                pass
+
         if completed_cleanly:
             try:
                 bot_state.increment_match(uid_str)
                 print_success(f"[★] Match #{match_index} Complete | UID: {uid_str}")
+                
+                # শুধু LEADER team file update করবে
+                if _team_state.get("leader_uid") == uid_str:
+                    update_team_state(status="ready_for_next", last_match_completed=datetime.now().isoformat())
+                    print_info(f"[TEAM-FILE] 📝 Updated by leader {uid_str}")
+                
                 async def _post_exp(uid):
                     try:
                         for wait in (5.0, 8.0, 12.0):
@@ -1608,7 +1733,7 @@ async def play_game(server_ip_port, thunder, sharma, udp_key, match_code,
                     except Exception: pass
                 asyncio.create_task(_post_exp(uid_str))
             except Exception: pass
-        movement_stop.set()
+
         ping_stop.set()
         if ping_task:
             ping_task.cancel()
@@ -1810,7 +1935,48 @@ async def functional_lone_wolf(addrs, starter_packet, account_region, client_ver
     # =========================================================
     async def _team_coordinator():
         try:
-            # ---- Step 0: অপেক্ষা করি সবাই peer এ যোগ হওয়া পর্যন্ত ----
+            # ---- Step 0: অপেক্ষা ----
+            # যদি team already created থাকে এবং আমি leader → শুধু match start
+            team_already_created = False
+            async with _team_state["lock"]:
+                if _team_state.get("team_code") is not None:
+                    team_already_created = True
+                    print_info(f"[TEAM] Team already exists (code={_team_state['team_code']}) — skipping create/invite")
+            
+            if team_already_created:
+                # সোজা ready + start_match পাঠাই
+                print_success(f"[TEAM] 🚀 LEADER using existing team — starting match directly")
+                own_id_num = None
+                if current_account_data:
+                    own_id_num = current_account_data.get('account_id')
+                if not own_id_num:
+                    try: own_id_num = int(uid_str)
+                    except: own_id_num = 0
+
+                # READY
+                try:
+                    rdy = ready_for_game(int(own_id_num), current_key, current_iv)
+                    if _writer_ref["w"] and not _writer_ref["w"].is_closing():
+                        _writer_ref["w"].write(rdy)
+                        await _writer_ref["w"].drain()
+                        print_info(f"[TEAM] ✅ LEADER ready_for_game sent")
+                except Exception as e:
+                    print_warning(f"[TEAM] ready err: {e}")
+
+                await asyncio.sleep(TEAM_START_DELAY)
+
+                # START MATCH
+                try:
+                    sm = start_match_team(int(own_id_num), current_key, current_iv, region=account_region)
+                    if _writer_ref["w"] and not _writer_ref["w"].is_closing():
+                        _writer_ref["w"].write(sm)
+                        await _writer_ref["w"].drain()
+                        print_success(f"[TEAM] ⚔ LEADER start_match sent")
+                except Exception as e:
+                    print_warning(f"[TEAM] start_match err: {e}")
+                return
+
+            # ---- অন্যথায়: নতুন team setup ----
             print_info(f"[TEAM] Waiting for all {TEAM_SIZE} bots to join peers...")
             while True:
                 async with _team_state["lock"]:
@@ -1918,47 +2084,40 @@ async def functional_lone_wolf(addrs, starter_packet, account_region, client_ver
 
             print_success(f"[TEAM] 🚀 {uid_str} LEADER — starting game loop")
 
-            # ---- Step 8: Main game start loop (প্রতি ৫ সেকেন্ডে ready+start) ----
-            while _team_active["flag"]:
-                try:
-                    if bot_state.is_paused(uid_str):
-                        break
-                    async with _team_state["lock"]:
-                        if _team_state["leader_uid"] != uid_str:
-                            break
+            # ---- Step 8: Leader — send ready + start_match ONCE ----
+            # Match শেষ হলে functional_lone_wolf এর outer loop আবার এখানে আসবে
+            print_success(f"[TEAM] 🚀 LEADER sending match start sequence (ONCE)...")
 
-                    own_id = current_account_data.get('account_id', own_id_num) if current_account_data else own_id_num
+            own_id = current_account_data.get('account_id', own_id_num) if current_account_data else own_id_num
 
-                    # ---- 8a: READY FOR GAME ----
-                    try:
-                        rdy = ready_for_game(int(own_id), current_key, current_iv)
-                        if _writer_ref["w"] and not _writer_ref["w"].is_closing():
-                            _writer_ref["w"].write(rdy)
-                            await _writer_ref["w"].drain()
-                            print_info(f"[TEAM] ✅ LEADER ready_for_game sent")
-                    except Exception as e:
-                        print_warning(f"[TEAM] ready err: {e}")
+            # ---- 8a: READY FOR GAME ----
+            try:
+                rdy = ready_for_game(int(own_id), current_key, current_iv)
+                if _writer_ref["w"] and not _writer_ref["w"].is_closing():
+                    _writer_ref["w"].write(rdy)
+                    await _writer_ref["w"].drain()
+                    print_info(f"[TEAM] ✅ LEADER ready_for_game sent")
+            except Exception as e:
+                print_warning(f"[TEAM] ready err: {e}")
 
-                    # ⭐ ৩ সেকেন্ড wait (ready ও start_match এর মাঝে)
-                    await asyncio.sleep(TEAM_START_DELAY)
+            # ⭐ TEAM_START_DELAY wait
+            await asyncio.sleep(TEAM_START_DELAY)
 
-                    # ---- 8c: START MATCH ----
-                    try:
-                        sm = start_match_team(int(own_id), current_key, current_iv, region=account_region)
-                        if _writer_ref["w"] and not _writer_ref["w"].is_closing():
-                            _writer_ref["w"].write(sm)
-                            await _writer_ref["w"].drain()
-                            print_success(f"[TEAM] ⚔ LEADER start_match sent")
-                    except Exception as e:
-                        print_warning(f"[TEAM] start_match err: {e}")
+            # ---- 8c: START MATCH ----
+            try:
+                sm = start_match_team(int(own_id), current_key, current_iv, region=account_region)
+                if _writer_ref["w"] and not _writer_ref["w"].is_closing():
+                    _writer_ref["w"].write(sm)
+                    await _writer_ref["w"].drain()
+                    print_success(f"[TEAM] ⚔ LEADER start_match sent (waiting for match)")
+            except Exception as e:
+                print_warning(f"[TEAM] start_match err: {e}")
 
-                except Exception as e:
-                    print_warning(f"[TEAM] leader loop err: {e}")
+            # Update team file status
+            update_team_state(status="in_match")
 
-                try:
-                    await asyncio.wait_for(asyncio.sleep(TEAM_LOOP_INTERVAL), timeout=TEAM_LOOP_INTERVAL + 0.5)
-                except asyncio.TimeoutError:
-                    pass
+            # ⭐ এখানে থেমে যায় — match শেষ হলে আবার outer loop আসবে
+            print_success(f"[TEAM] 🎮 LEADER waiting for match to start (no more start_match until match ends)")
 
         except asyncio.CancelledError:
             raise
@@ -1980,10 +2139,17 @@ async def functional_lone_wolf(addrs, starter_packet, account_region, client_ver
 
             print_info(f"[TEAM] 🧑 {uid_str} = MEMBER — waiting for leader invite...")
 
-            # ---- Step 2: সবাই join করা + 3s delay এর জন্য অপেক্ষা ----
-            # Leader: create(1.5) + fresh(1) + 3 invite(3) + post(2) + fresh2(0) + 3s = ~10.5s
-            # Member safe margin: 13s wait
-            await asyncio.sleep(1.0)
+            # ---- Step 2: check if team already exists ----
+            team_already_created = False
+            async with _team_state["lock"]:
+                if _team_state.get("team_code") is not None:
+                    team_already_created = True
+
+            if team_already_created:
+                print_success(f"[TEAM] 🚀 Member {uid_str} — team exists, sending match start")
+            else:
+                # নতুন team setup এর জন্য অপেক্ষা
+                await asyncio.sleep(1.0)
 
             async with _team_state["lock"]:
                 if _team_state["leader_uid"] == uid_str:
@@ -1993,41 +2159,31 @@ async def functional_lone_wolf(addrs, starter_packet, account_region, client_ver
 
             my_id = current_account_data.get('account_id', uid_str) if current_account_data else uid_str
 
-            # ---- Step 3: Main loop — ready + 3s + start_match, every 5s ----
-            while _team_active["flag"]:
-                try:
-                    if bot_state.is_paused(uid_str):
-                        break
-                    if _writer_ref["w"] and not _writer_ref["w"].is_closing():
+            # ---- Step 3: Member — send ready + start_match ONCE ----
+            print_success(f"[TEAM] 🚀 Member {uid_str} sending match start sequence (ONCE)...")
 
-                        # --- READY ---
-                        try:
-                            rdy = ready_for_game(int(my_id), current_key, current_iv)
-                            _writer_ref["w"].write(rdy)
-                            await _writer_ref["w"].drain()
-                            print_info(f"[TEAM] ✅ member ready_for_game sent")
-                        except Exception as e:
-                            print_warning(f"[TEAM] member ready err: {e}")
+            # --- READY ---
+            try:
+                rdy = ready_for_game(int(my_id), current_key, current_iv)
+                _writer_ref["w"].write(rdy)
+                await _writer_ref["w"].drain()
+                print_info(f"[TEAM] ✅ member ready_for_game sent")
+            except Exception as e:
+                print_warning(f"[TEAM] member ready err: {e}")
 
-                        # --- ⭐ 3 সেকেন্ড wait ---
-                        await asyncio.sleep(TEAM_START_DELAY)
+            # --- ⭐ TEAM_START_DELAY wait ---
+            await asyncio.sleep(TEAM_START_DELAY)
 
-                        # --- START MATCH ---
-                        try:
-                            sm = start_match_team(int(my_id), current_key, current_iv, region=account_region)
-                            _writer_ref["w"].write(sm)
-                            await _writer_ref["w"].drain()
-                            print_success(f"[TEAM] ⚔ member start_match sent")
-                        except Exception as e:
-                            print_warning(f"[TEAM] member start err: {e}")
+            # --- START MATCH ---
+            try:
+                sm = start_match_team(int(my_id), current_key, current_iv, region=account_region)
+                _writer_ref["w"].write(sm)
+                await _writer_ref["w"].drain()
+                print_success(f"[TEAM] ⚔ member start_match sent (waiting for match)")
+            except Exception as e:
+                print_warning(f"[TEAM] member start err: {e}")
 
-                except Exception as e:
-                    print_warning(f"[TEAM] member loop err: {e}")
-
-                try:
-                    await asyncio.wait_for(asyncio.sleep(TEAM_LOOP_INTERVAL), timeout=TEAM_LOOP_INTERVAL + 0.5)
-                except asyncio.TimeoutError:
-                    pass
+            print_success(f"[TEAM] 🎮 Member {uid_str} waiting for match (no more start_match until match ends)")
 
         except asyncio.CancelledError:
             raise
@@ -2110,9 +2266,41 @@ async def functional_lone_wolf(addrs, starter_packet, account_region, client_ver
                         "writer": writer, "data": current_account_data,
                         "key": current_key, "iv": current_iv,
                     }
-                    if _team_state["leader_uid"] is None:
+                    
+                    # ⭐ JSON file থেকে leader চেক করি
+                    team_file = load_team_state()
+                    preferred_leader_auth = ""
+                    preferred_leader_acc = ""
+                    
+                    if team_file:
+                        preferred_leader_auth = str(team_file.get("leader_uid", "")).strip()
+                        preferred_leader_acc = str(team_file.get("leader_account_id", "") or "").strip()
+                    
+                    my_acc_id = ""
+                    my_auth = ""
+                    if current_account_data:
+                        my_acc_id = str(current_account_data.get("account_id", "")).strip()
+                        my_auth = str(current_account_data.get("auth_uid", "")).strip()
+                    
+                    print_info(f"[TEAM-DBG] {uid_str} | my_auth={my_auth} | my_acc={my_acc_id} | "
+                               f"file_leader_auth={preferred_leader_auth} | "
+                               f"file_leader_acc={preferred_leader_acc} | "
+                               f"current_leader={_team_state['leader_uid']}")
+                    
+                    is_me_leader = False
+                    if preferred_leader_auth and my_auth == preferred_leader_auth:
+                        is_me_leader = True
+                    elif preferred_leader_acc and my_acc_id == preferred_leader_acc:
+                        is_me_leader = True
+                    elif not preferred_leader_auth and not preferred_leader_acc:
+                        # team file খালি
+                        is_me_leader = True
+                    
+                    if is_me_leader and _team_state["leader_uid"] is None:
                         _team_state["leader_uid"] = uid_str
-                        print_success(f"[TEAM] 👑 {uid_str} is first peer (leader)")
+                        print_success(f"[TEAM] 👑 {uid_str} = LEADER")
+                    else:
+                        print_info(f"[TEAM] {uid_str} = MEMBER (waiting)")
 
                 # ---------- SOLO match trigger with ready_for_game prep ----------
                 async def send_solo_start_match():
@@ -2367,9 +2555,8 @@ async def functional_lone_wolf(addrs, starter_packet, account_region, client_ver
                 _team_active["flag"] = False
                 async with _team_state["lock"]:
                     _team_state["peers"].pop(uid_str, None)
-                    if _team_state["leader_uid"] == uid_str:
-                        _team_state["leader_uid"] = None
-                        _team_state["team_code"] = None
+                    # ⚠️ leader_uid এবং team_code রাখুন — পরের match এ লাগবে
+                    # শুধু peers clear হবে reconnect এর সময়
                 for tk in (team_coord_task, member_trigger_task):
                     if tk and not tk.done():
                         tk.cancel()
@@ -2778,6 +2965,15 @@ async def create_four_accounts(region: str, clan_id: str, count: int = 4, passwo
         _team_state["peers"].clear()
         _team_state["leader_uid"] = None
         _team_state["team_code"] = None
+    
+    # ⭐ পুরোনো team file delete করি
+    try:
+        if os.path.exists(TEAM_STATE_FILE):
+            os.remove(TEAM_STATE_FILE)
+            print_info(f"[TEAM-FILE] 🗑 Deleted old {TEAM_STATE_FILE}")
+    except Exception:
+        pass
+    
     print_success(f"[TEAM] 🧹 Team state reset for new {count}-bot team")
 
     def _prog(s):
@@ -3066,6 +3262,22 @@ async def create_four_accounts(region: str, clan_id: str, count: int = 4, passwo
             _prog(f"📦 {len(created)} accounts saved to accounts.json")
         except Exception as e:
             _prog(f"⚠️ could not save accounts.json: {e}")
+
+        # ---------- 4.5) Save TEAM state file ----------
+        try:
+            leader_auth_uid = str(created[0]['auth_uid'])
+            member_auth_uids = [str(a['auth_uid']) for a in created[1:]]
+            
+            save_team_state(
+                leader_auth_uid=leader_auth_uid,
+                member_auth_uids=member_auth_uids,
+                region=region,
+                clan_id=clan_id,
+                created_list=created,   # ⭐ পুরো list পাঠাই
+            )
+            _prog(f"📄 Team file created | leader_auth = {leader_auth_uid}")
+        except Exception as e:
+            _prog(f"⚠️ Could not save team file: {e}")
 
         # ---------- 5) Launch workers ----------
         _prog(f"🚀 Starting {len(created)} bot workers...")

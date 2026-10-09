@@ -304,7 +304,7 @@ body::after{
 /* ============================================================
    STATS GRID
    ============================================================ */
-.stats{display:grid;grid-template-columns:repeat(5, 1fr);gap:12px;margin-bottom:18px}
+.stats{display:grid;grid-template-columns:repeat(6, 1fr);gap:12px;margin-bottom:18px}
 .stat-card{
     padding:16px 18px;
     background:var(--bg-elev-1);
@@ -334,13 +334,14 @@ body::after{
     line-height:1.1;
     margin-bottom:6px;
 }
-.stat-foot{font-size:11px;color:var(--text-3);font-weight:500}
+.stat-foot{font-size:11px;color:var(--text-3);font-weight:500;font-family:var(--font-mono);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 
 .stat-card.accent-indigo .stat-icon{color:var(--accent);background:rgba(99,102,241,.1)}
 .stat-card.accent-violet .stat-icon{color:var(--accent-2);background:rgba(139,92,246,.1)}
 .stat-card.accent-success .stat-icon{color:var(--success);background:rgba(16,185,129,.1)}
 .stat-card.accent-warning .stat-icon{color:var(--warning);background:rgba(245,158,11,.1)}
 .stat-card.accent-info .stat-icon{color:var(--info);background:rgba(6,182,212,.1)}
+.stat-card.accent-danger .stat-icon{color:var(--danger);background:rgba(239,68,68,.1)}
 
 /* ============================================================
    WORKSPACE
@@ -429,6 +430,12 @@ body::after{
     padding:1px 6px;
     font-family:var(--font-mono);font-size:9.5px;font-weight:600;letter-spacing:.04em;
     color:var(--accent-2);background:rgba(139,92,246,.1);border:1px solid rgba(139,92,246,.2);
+    border-radius:4px;flex-shrink:0;
+}
+.leader-tag{
+    padding:1px 6px;
+    font-family:var(--font-mono);font-size:9.5px;font-weight:700;letter-spacing:.04em;
+    color:#fbbf24;background:rgba(245,158,11,.12);border:1px solid rgba(245,158,11,.3);
     border-radius:4px;flex-shrink:0;
 }
 .acc-uid{display:flex;align-items:center;gap:6px;font-family:var(--font-mono);font-size:11px;color:var(--text-3);letter-spacing:.01em}
@@ -744,6 +751,9 @@ body::after{
 /* ============================================================
    RESPONSIVE
    ============================================================ */
+@media(max-width:1400px){
+    .stats{grid-template-columns:repeat(3,1fr)}
+}
 @media(max-width:1200px){
     .stats{grid-template-columns:repeat(3,1fr)}
     .workspace{grid-template-columns:1fr}
@@ -903,6 +913,14 @@ body::after{
             </div>
             <div class="stat-value" id="s-botfiles">0</div>
             <div class="stat-foot">MAHIR_*.json saved</div>
+        </div>
+        <div class="stat-card accent-danger">
+            <div class="stat-head">
+                <span class="stat-label">Team Info</span>
+                <div class="stat-icon"><i class="fa-solid fa-users-gear"></i></div>
+            </div>
+            <div class="stat-value" id="s-team-size">0</div>
+            <div class="stat-foot" id="s-team-info">No team yet</div>
         </div>
     </section>
 
@@ -1499,17 +1517,12 @@ async function viewBotFile(filename){
 
 function syntaxHighlightJson(json){
     let s = esc(json);
-    // Keys (before colon) → blue
     s = s.replace(/&quot;([^&]*?)&quot;(\s*:)/g,
         '<span class="jv-key">&quot;$1&quot;</span>$2');
-    // String values → green
     s = s.replace(/:(\s*)&quot;([^&]*?)&quot;/g,
         ':$1<span class="jv-str">&quot;$2&quot;</span>');
-    // Numbers → yellow
     s = s.replace(/(:\s*)(-?\d+\.?\d*)/g, '$1<span class="jv-num">$2</span>');
-    // Booleans → violet
     s = s.replace(/\b(true|false)\b/g, '<span class="jv-bool">$1</span>');
-    // Null → gray
     s = s.replace(/\bnull\b/g, '<span class="jv-null">null</span>');
     return s;
 }
@@ -1698,6 +1711,9 @@ function renderAccounts(list){
         if(!uids.has(c.dataset.uid)) c.remove();
     });
 
+    // Determine leader from API data
+    const leaderUid = window._leaderUid || "";
+
     list.forEach(acc => {
         const uid = String(acc.uid);
         const level = Math.max(1, parseInt(acc.level) || 1);
@@ -1719,6 +1735,8 @@ function renderAccounts(list){
         else if(status === "in_match"){ chipCls = "match"; chipText = `In Match (${acc.active_matches || 1})`; }
         else if(status === "searching"){ chipCls = "search"; chipText = "Searching"; }
         else if(status !== "online"){ chipCls = "error"; chipText = status.toUpperCase(); }
+
+        const isLeader = (leaderUid && (uid === leaderUid || acc.auth_uid === leaderUid));
 
         let card = document.getElementById("acc-" + uid);
         if(!card){
@@ -1743,6 +1761,7 @@ function renderAccounts(list){
                         <div class="acc-name-row">
                             <span class="acc-name">${esc(acc.nickname || "Unknown")}</span>
                             <span class="region-tag">${esc(acc.region || "BD")}</span>
+                            ${isLeader ? '<span class="leader-tag">👑 LEADER</span>' : ''}
                         </div>
                         <div class="acc-uid">
                             <span>UID ${esc(uid)}</span>
@@ -1874,6 +1893,19 @@ async function fetchStats(){
     setText("s-exp", "+" + Number(d.total_gained_exp || 0).toLocaleString());
     setText("s-active", (d.total_active_matches || 0) + " active");
     setText("s-botfiles", d.bot_files_count || 0);
+
+    // ⭐ Team Info
+    window._leaderUid = d.leader_uid || "";
+    setText("s-team-size", d.team_size || 0);
+    const tc = d.team_code;
+    const lu = d.leader_uid;
+    if(tc && lu){
+        setText("s-team-info", `Code ${tc} • Lead …${String(lu).slice(-6)}`);
+    } else if(lu){
+        setText("s-team-info", `Lead …${String(lu).slice(-6)}`);
+    } else {
+        setText("s-team-info", "No team yet");
+    }
 
     const online = accs.filter(a => a.status === "ONLINE" || a.status === "IN_MATCH").length;
     setText("s-online", online + " online");
